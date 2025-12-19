@@ -750,7 +750,12 @@ jobs:
     - name: Set Outputs
       if: always() && steps.connectivity.outcome != 'skipped'
       run: |
-        echo "app_url=http://${{ needs.load-config.outputs.static_ip }}/" >> $GITHUB_OUTPUT
+        VERIFICATION_PORT="${{ needs.load-config.outputs.verification_port }}"
+        if [ "$VERIFICATION_PORT" = "80" ]; then
+          echo "app_url=http://${{ needs.load-config.outputs.static_ip }}/" >> $GITHUB_OUTPUT
+        else
+          echo "app_url=http://${{ needs.load-config.outputs.static_ip }}:${VERIFICATION_PORT}/" >> $GITHUB_OUTPUT
+        fi
         echo "status=${{ steps.connectivity.outputs.status || 'failed' }}" >> $GITHUB_OUTPUT
 
     - name: Deployment Summary
@@ -760,5 +765,10 @@ jobs:
         echo "- **Application**: ${{ needs.load-config.outputs.app_name }} v${{ needs.load-config.outputs.app_version }}" >> $GITHUB_STEP_SUMMARY
         echo "- **OS Type**: ${{ needs.load-config.outputs.os_type }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Package Manager**: ${{ needs.load-config.outputs.package_manager }}" >> $GITHUB_STEP_SUMMARY
-        echo "- **URL**: http://${{ needs.load-config.outputs.static_ip }}/" >> $GITHUB_STEP_SUMMARY
+        VERIFICATION_PORT="${{ needs.load-config.outputs.verification_port }}"
+        if [ "$VERIFICATION_PORT" = "80" ]; then
+          echo "- **URL**: http://${{ needs.load-config.outputs.static_ip }}/" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "- **URL**: http://${{ needs.load-config.outputs.static_ip }}:${VERIFICATION_PORT}/" >> $GITHUB_STEP_SUMMARY
+        fi
         echo "- **Status**: ${{ steps.connectivity.outputs.status || 'failed' }}" >> $GITHUB_STEP_SUMMARY
