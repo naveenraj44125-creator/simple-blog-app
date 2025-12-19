@@ -748,6 +748,7 @@ jobs:
         exit 1
 
     - name: Set Outputs
+      id: set-outputs
       if: always() && steps.connectivity.outcome != 'skipped'
       run: |
         VERIFICATION_PORT="${{ needs.load-config.outputs.verification_port }}"
