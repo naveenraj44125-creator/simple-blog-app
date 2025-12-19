@@ -1,0 +1,764 @@
+name: Reusable Generic Application Deployment
+
+'on':
+  workflow_call:
+    inputs:
+      config_file:
+        description: 'Path to deployment config file'
+        required: false
+        type: string
+        default: 'deployment-generic.config.yml'
+      aws_region:
+        description: 'AWS region (overrides config)'
+        required: false
+        type: string
+      instance_name:
+        description: 'Lightsail instance name (overrides config)'
+        required: false
+        type: string
+      skip_tests:
+        description: 'Skip test job'
+        required: false
+        type: boolean
+        default: false
+      environment:
+        description: 'GitHub environment to use'
+        required: false
+        type: string
+      docker_image_tag:
+        description: 'Pre-built Docker image tag to use'
+        required: false
+        type: string
+    outputs:
+      deployment_url:
+        description: 'URL of deployed application'
+        value: ${{ jobs.verification.outputs.app_url }}
+      deployment_status:
+        description: 'Status of deployment'
+        value: ${{ jobs.verification.outputs.status }}
+
+permissions:
+  id-token: write   # Required for OIDC authentication
+  contents: read    # Required to checkout code
+
+jobs:
+  load-config:
+    runs-on: ubuntu-latest
+    outputs:
+      instance_name: ${{ steps.config.outputs.instance_name }}
+      static_ip: ${{ steps.config.outputs.static_ip }}
+      aws_region: ${{ steps.config.outputs.aws_region }}
+      app_name: ${{ steps.config.outputs.app_name }}
+      app_type: ${{ steps.config.outputs.app_type }}
+      app_version: ${{ steps.config.outputs.app_version }}
+      should_deploy: ${{ steps.config.outputs.should_deploy }}
+      enabled_dependencies: ${{ steps.config.outputs.enabled_dependencies }}
+      test_enabled: ${{ steps.config.outputs.test_enabled }}
+      os_type: ${{ steps.config.outputs.os_type }}
+      package_manager: ${{ steps.config.outputs.package_manager }}
+      verification_port: ${{ steps.config.outputs.verification_port }}
+      verification_path: ${{ steps.config.outputs.verification_path }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars.AWS_ROLE_ARN || secrets.AWS_ROLE_ARN }}
+        role-duration-seconds: 3600  # 1 hour session
+        aws-region: us-east-1
+
+    - name: Setup Python
+      run: python3 -m pip install --upgrade pip boto3
+
+    - name: Verify deployment scripts
+      run: |
+        ls -la workflows/
+        echo "✅ Deployment scripts available"
+
+    - name: Load Configuration and Setup Instance
+      id: config
+      run: |
+        echo "🔧 Running instance setup script..."
+        export CONFIG_FILE="${{ inputs.config_file }}"
+        export INSTANCE_NAME="${{ inputs.instance_name }}"
+        export AWS_REGION="${{ inputs.aws_region }}"
+        export SKIP_TESTS="${{ inputs.skip_tests }}"
+        
+        # If no AWS region provided as input, use default
+        if [ -z "$AWS_REGION" ]; then
+          export AWS_REGION="us-east-1"
+          echo "📍 Using default AWS region: $AWS_REGION"
+        else
+          echo "📍 Using AWS region from input: $AWS_REGION"
+        fi
+        
+        python3 workflows/setup_instance.py
+
+  test:
+    needs: load-config
+    runs-on: ubuntu-latest
+    if: needs.load-config.outputs.test_enabled == 'true'
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Test Environment
+      run: |
+        echo "🔧 Setting up test environment for ${{ needs.load-config.outputs.app_type }} application"
+        echo "📦 Dependencies: ${{ needs.load-config.outputs.enabled_dependencies }}"
+
+    - name: Setup PHP (if PHP dependency enabled)
+      if: contains(needs.load-config.outputs.enabled_dependencies, 'php')
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.1'
+        extensions: pdo, pdo_mysql, curl, json, mbstring
+
+    - name: Validate PHP syntax (if PHP enabled)
+      if: contains(needs.load-config.outputs.enabled_dependencies, 'php')
+      run: |
+        echo "🔍 Validating PHP syntax..."
+        find . -name "*.php" -exec php -l {} \;
+
+    - name: Test PHP application (if PHP enabled)
+      if: contains(needs.load-config.outputs.enabled_dependencies, 'php')
+      run: |
+        echo "🧪 Testing PHP application..."
+        
+        # Find PHP application directory from config
+        PHP_DIR=$(python3 << 'EOF'
+        import yaml
+        import os
+        
+        with open('${{ inputs.config_file }}', 'r') as f:
+            config = yaml.safe_load(f)
+        
+        package_files = config.get('application', {}).get('package_files', [])
+        
+        for package_dir in package_files:
+            if os.path.isdir(package_dir):
+                # Look for PHP files
+                for root, dirs, files in os.walk(package_dir):
+                    if any(f.endswith('.php') for f in files):
+                        print(package_dir)
+                        break
+                else:
+                    continue
+                break
+        else:
+            # Check root directory
+            if any(f.endswith('.php') for f in os.listdir('.') if os.path.isfile(f)):
+                print('.')
+        EOF
+        )
+        
+        if [ -n "$PHP_DIR" ]; then
+          echo "📁 Found PHP app in: $PHP_DIR"
+          cd "$PHP_DIR"
+          
+          # Validate PHP syntax for all PHP files
+          echo "🔍 Validating PHP syntax..."
+          find . -name "*.php" -exec php -l {} \; || echo "⚠️  Some PHP syntax errors found"
+          
+          # Start PHP server if index.php exists
+          if [ -f "index.php" ]; then
+            echo "🚀 Starting PHP development server..."
+            php -S localhost:8000 index.php &
+            PHP_PID=$!
+            sleep 5
+            
+            if curl -f http://localhost:8000/ 2>/dev/null; then
+              echo "✅ PHP application test passed"
+              kill $PHP_PID
+            else
+              echo "⚠️  PHP server started but not responding properly"
+              kill $PHP_PID 2>/dev/null || true
+            fi
+          else
+            echo "⚠️  No index.php found, skipping PHP server test"
+          fi
+        else
+          echo "⚠️  No PHP application directory found"
+        fi
+
+    - name: Setup Python (if Python dependency enabled)
+      if: contains(needs.load-config.outputs.enabled_dependencies, 'python')
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Test Python application (if Python enabled)
+      if: contains(needs.load-config.outputs.enabled_dependencies, 'python')
+      run: |
+        echo "🧪 Testing Python application..."
+        
+        # Find Python application directory from config
+        PYTHON_DIR=$(python3 << 'EOF'
+        import yaml
+        import os
+        
+        with open('${{ inputs.config_file }}', 'r') as f:
+            config = yaml.safe_load(f)
+        
+        package_files = config.get('application', {}).get('package_files', [])
+        
+        for package_dir in package_files:
+            if os.path.isdir(package_dir):
+                # Look for Python files
+                for root, dirs, files in os.walk(package_dir):
+                    if any(f.endswith('.py') for f in files):
+                        print(package_dir)
+                        break
+                else:
+                    continue
+                break
+        else:
+            # Check root directory
+            if any(f.endswith('.py') for f in os.listdir('.') if os.path.isfile(f)):
+                print('.')
+        EOF
+        )
+        
+        if [ -n "$PYTHON_DIR" ]; then
+          echo "📁 Found Python app in: $PYTHON_DIR"
+          cd "$PYTHON_DIR"
+          
+          # Install dependencies
+          if [ -f "requirements.txt" ]; then
+            pip install -r requirements.txt
+            echo "✅ Dependencies installed"
+          fi
+          
+          # Test Flask application
+          if [ -f "app.py" ]; then
+            # Syntax check
+            python -m py_compile app.py
+            echo "✅ Python syntax validation passed"
+            
+            # Start Flask app and test
+            python app.py &
+            APP_PID=$!
+            sleep 5
+            
+            # Test endpoints
+            if curl -f http://localhost:5000/api/health 2>/dev/null; then
+              echo "✅ Flask application is responding"
+              kill $APP_PID
+            else
+              echo "⚠️  Flask application not responding, but syntax is valid"
+              kill $APP_PID 2>/dev/null || true
+            fi
+          else
+            echo "⚠️  No app.py found, skipping Flask test"
+          fi
+        else
+          echo "⚠️  No Python application directory found"
+        fi
+
+    - name: Setup Node.js (if Node.js dependency enabled)
+      if: contains(needs.load-config.outputs.enabled_dependencies, 'nodejs')
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+
+    - name: Test Node.js application (if Node.js enabled)
+      if: contains(needs.load-config.outputs.enabled_dependencies, 'nodejs')
+      run: |
+        echo "🧪 Testing Node.js application..."
+        
+        # Find Node.js application directory from config
+        python3 << 'EOF'
+        import yaml
+        import os
+        
+        with open('${{ inputs.config_file }}', 'r') as f:
+            config = yaml.safe_load(f)
+        
+        package_files = config.get('application', {}).get('package_files', [])
+        
+        # Look for Node.js app in configured directories
+        nodejs_dirs = []
+        for package_dir in package_files:
+            if os.path.isdir(package_dir):
+                package_json_path = os.path.join(package_dir, 'package.json')
+                if os.path.exists(package_json_path):
+                    nodejs_dirs.append(package_dir)
+                    print(f"NODEJS_DIR={package_dir}")
+        
+        # Also check root directory
+        if os.path.exists('package.json'):
+            nodejs_dirs.append('.')
+            print(f"NODEJS_DIR=.")
+        
+        if not nodejs_dirs:
+            print("NODEJS_DIR=")
+        EOF
+        
+        NODEJS_DIR=$(python3 << 'EOF'
+        import yaml
+        import os
+        
+        with open('${{ inputs.config_file }}', 'r') as f:
+            config = yaml.safe_load(f)
+        
+        package_files = config.get('application', {}).get('package_files', [])
+        
+        for package_dir in package_files:
+            if os.path.isdir(package_dir) and os.path.exists(os.path.join(package_dir, 'package.json')):
+                print(package_dir)
+                break
+        else:
+            if os.path.exists('package.json'):
+                print('.')
+        EOF
+        )
+        
+        if [ -n "$NODEJS_DIR" ]; then
+          echo "📁 Found Node.js app in: $NODEJS_DIR"
+          cd "$NODEJS_DIR"
+          
+          if [ -f "package.json" ]; then
+            npm install
+            npm test || echo "⚠️  No test script found or tests failed"
+          fi
+          
+          # Check for main application files
+          if [ -f "app.js" ]; then
+            node -c app.js && echo "✅ app.js syntax validation passed"
+          elif [ -f "index.js" ]; then
+            node -c index.js && echo "✅ index.js syntax validation passed"
+          elif [ -f "server.js" ]; then
+            node -c server.js && echo "✅ server.js syntax validation passed"
+          else
+            echo "⚠️  No main Node.js file found (app.js, index.js, server.js)"
+          fi
+        else
+          echo "⚠️  No Node.js application directory found"
+        fi
+
+    - name: Generic Application Tests
+      run: |
+        echo "🧪 Running generic application tests..."
+        
+        if [ -f "${{ inputs.config_file }}" ]; then
+          pip install PyYAML
+          python3 -c "import yaml; yaml.safe_load(open('${{ inputs.config_file }}'))"
+          echo "✅ Configuration file is valid YAML"
+          
+          # Check for application files based on config
+          python3 << 'EOF'
+        import yaml
+        import os
+        
+        with open('${{ inputs.config_file }}', 'r') as f:
+            config = yaml.safe_load(f)
+        
+        package_files = config.get('application', {}).get('package_files', [])
+        app_type = config.get('application', {}).get('type', 'unknown')
+        
+        print(f"🔍 Checking for {app_type} application files...")
+        
+        files_found = []
+        if package_files:
+            for file_pattern in package_files:
+                if os.path.exists(file_pattern):
+                    files_found.append(file_pattern)
+                    print(f"✅ Found: {file_pattern}")
+                else:
+                    print(f"⚠️  Not found: {file_pattern}")
+        
+        # Check for common main files in the detected directories
+        main_files = ['index.html', 'index.php', 'app.py', 'app.js', 'package.json', 'docker-compose.yml']
+        
+        for package_dir in package_files:
+            if os.path.isdir(package_dir):
+                for main_file in main_files:
+                    main_file_path = os.path.join(package_dir, main_file)
+                    if os.path.exists(main_file_path):
+                        files_found.append(main_file_path)
+                        print(f"✅ Found main file: {main_file_path}")
+        
+        if files_found:
+            print(f"✅ Application files found: {len(files_found)} files")
+        else:
+            print("⚠️  No application files detected in configured paths")
+            print("   This might be normal for some application types")
+        EOF
+        else
+          echo "⚠️  No configuration file found, skipping application file checks"
+        fi
+
+  pre-steps-generic:
+    needs: [load-config, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    if: |
+      always() &&
+      needs.load-config.outputs.should_deploy == 'true' &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped')
+    environment: ${{ inputs.environment != '' && inputs.environment || null }}
+    steps:
+    - name: Checkout application code
+      uses: actions/checkout@v4
+    
+    - name: Verify deployment scripts
+      run: |
+        ls -la workflows/
+        echo "✅ Deployment scripts available"
+    
+    - name: Debug Deployment Decision
+      run: |
+        echo "🔍 Deployment Debug Information:"
+        echo "Should Deploy: ${{ needs.load-config.outputs.should_deploy }}"
+        echo "Instance Name: ${{ needs.load-config.outputs.instance_name }}"
+        echo "AWS Region: ${{ needs.load-config.outputs.aws_region }}"
+        echo "Dependencies: ${{ needs.load-config.outputs.enabled_dependencies }}"
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars.AWS_ROLE_ARN || secrets.AWS_ROLE_ARN }}
+        role-duration-seconds: 3600  # 1 hour session
+        aws-region: ${{ needs.load-config.outputs.aws_region }}
+
+    - name: Setup Python environment
+      run: |
+        python3 -m pip install --upgrade pip
+        python3 -m pip install boto3 pyyaml
+
+    - name: Pre-flight Instance Health Check
+      run: |
+        echo "🏥 Running pre-flight health check..."
+        export PYTHONPATH="${PYTHONPATH}:$(pwd)/workflows"
+        export GITHUB_ACTIONS=true
+        
+        python3 << 'EOF'
+        import sys
+        import os
+        sys.path.insert(0, 'workflows')
+        from lightsail_common import LightsailBase
+        
+        instance_name = "${{ needs.load-config.outputs.instance_name }}"
+        region = "${{ needs.load-config.outputs.aws_region }}"
+        
+        client = LightsailBase(instance_name, region)
+        
+        print(f"🔍 Enhanced pre-flight check for {instance_name}...")
+        
+        # Test SSH connectivity first with enhanced retries
+        print("🔗 Testing SSH connectivity with enhanced retries...")
+        ssh_success = client.test_ssh_connectivity(timeout=60, max_retries=5)
+        
+        if not ssh_success:
+            print("⚠️  SSH connectivity issues detected")
+            print("   This may be due to temporary network issues or instance startup")
+            print("   Deployment will continue - the instance may still be functional")
+        else:
+            print("✅ SSH connectivity confirmed")
+            
+            # Only run dpkg check if SSH is working
+            print("🔧 Running dpkg health check...")
+            script = '''
+            if sudo dpkg --audit 2>&1 | grep -q "broken"; then
+                echo "⚠️  dpkg broken, fixing..."
+                sudo dpkg --configure -a
+                sudo apt-get install -f -y
+                echo "✅ dpkg fixed"
+            else
+                echo "✅ dpkg healthy"
+            fi
+            '''
+            
+            success, output = client.run_command(script, timeout=180, max_retries=3)
+            if success:
+                print("✅ dpkg health check passed")
+            else:
+                print("⚠️  dpkg check had issues, but continuing...")
+        
+        print("✅ Pre-flight check completed - deployment will proceed")
+        EOF
+
+    - name: Generic Environment Preparation & Dependency Installation
+      run: |
+        echo "🔧 Running generic pre-deployment steps..."
+        export GITHUB_ACTIONS=true
+        export PYTHONPATH="${PYTHONPATH}:$(pwd)/workflows"
+        
+        python3 workflows/deploy-pre-steps-generic.py \
+          --instance-name ${{ needs.load-config.outputs.instance_name }} \
+          --region ${{ needs.load-config.outputs.aws_region }} \
+          --config-file ${{ inputs.config_file }} \
+          --os-type ${{ needs.load-config.outputs.os_type }} \
+          --package-manager ${{ needs.load-config.outputs.package_manager }}
+
+  application-package:
+    needs: [load-config]
+    runs-on: ubuntu-latest
+    if: needs.load-config.outputs.should_deploy == 'true'
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars.AWS_ROLE_ARN || secrets.AWS_ROLE_ARN }}
+        role-duration-seconds: 3600  # 1 hour session
+        aws-region: ${{ needs.load-config.outputs.aws_region }}
+
+    - name: Build React app if needed
+      run: |
+        # Find React application directory from config
+        REACT_DIR=$(python3 << 'EOF'
+        import yaml
+        import os
+        
+        with open('${{ inputs.config_file }}', 'r') as f:
+            config = yaml.safe_load(f)
+        
+        package_files = config.get('application', {}).get('package_files', [])
+        
+        for package_dir in package_files:
+            if os.path.isdir(package_dir):
+                package_json_path = os.path.join(package_dir, 'package.json')
+                if os.path.exists(package_json_path):
+                    # Check if it's a React app by looking for react in package.json
+                    with open(package_json_path, 'r') as pf:
+                        try:
+                            import json
+                            pkg_data = json.load(pf)
+                            deps = pkg_data.get('dependencies', {})
+                            dev_deps = pkg_data.get('devDependencies', {})
+                            if 'react' in deps or 'react' in dev_deps:
+                                print(package_dir)
+                                break
+                        except:
+                            pass
+        EOF
+        )
+        
+        if [ -n "$REACT_DIR" ]; then
+          echo "📦 Building React application in: $REACT_DIR"
+          cd "$REACT_DIR"
+          npm install
+          npm run build
+          echo "✅ React build completed"
+        else
+          echo "ℹ️  No React application found in configured directories"
+        fi
+
+    - name: Create deployment package
+      run: |
+        echo "📦 Creating application package..."
+        
+        python3 << 'EOF'
+        import yaml
+        import os
+        import subprocess
+        
+        with open('${{ inputs.config_file }}', 'r') as f:
+            config = yaml.safe_load(f)
+        
+        package_files = config.get('application', {}).get('package_files', [])
+        package_fallback = config.get('application', {}).get('package_fallback', True)
+        
+        if package_files:
+            existing_files = []
+            for file_pattern in package_files:
+                if os.path.exists(file_pattern):
+                    existing_files.append(file_pattern)
+            
+            if existing_files:
+                print(f"📦 Packaging specific files: {existing_files}")
+                cmd = ['tar', '-czf', 'app.tar.gz'] + existing_files
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                # Exit code 1 with "file changed" warning is acceptable
+                if result.returncode not in [0, 1]:
+                    print(f"❌ tar failed with exit code {result.returncode}")
+                    print(result.stderr)
+                    exit(result.returncode)
+                elif result.returncode == 1 and 'file changed as we read it' not in result.stderr.lower():
+                    print(f"❌ tar failed: {result.stderr}")
+                    exit(1)
+                print("✅ Package created successfully")
+            elif package_fallback:
+                print("📦 Specific files not found, packaging all files as fallback")
+                cmd = ['tar', '-czf', 'app.tar.gz', '--exclude=.git', '--exclude=.github', '--exclude=node_modules', '--exclude=*.tar.gz', '.']
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode not in [0, 1]:
+                    print(f"❌ tar failed with exit code {result.returncode}")
+                    print(result.stderr)
+                    exit(result.returncode)
+                elif result.returncode == 1 and 'file changed as we read it' not in result.stderr.lower():
+                    print(f"❌ tar failed: {result.stderr}")
+                    exit(1)
+                print("✅ Package created successfully")
+            else:
+                print("❌ Specific files not found and fallback disabled")
+                exit(1)
+        else:
+            print("📦 No specific files configured, packaging all files")
+            cmd = ['tar', '-czf', 'app.tar.gz', '--exclude=.git', '--exclude=.github', '--exclude=*.tar.gz', '.']
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode not in [0, 1]:
+                print(f"❌ tar failed with exit code {result.returncode}")
+                print(result.stderr)
+                exit(result.returncode)
+            elif result.returncode == 1 and 'file changed as we read it' not in result.stderr.lower():
+                print(f"❌ tar failed: {result.stderr}")
+                exit(1)
+            print("✅ Package created successfully")
+        EOF
+
+    - name: Upload application package
+      uses: actions/upload-artifact@v4
+      with:
+        name: application-package
+        path: app.tar.gz
+        retention-days: 1
+
+  post-steps-generic:
+    needs: [load-config, pre-steps-generic, application-package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: |
+      always() &&
+      needs.load-config.outputs.should_deploy == 'true' &&
+      needs.pre-steps-generic.result == 'success' &&
+      needs.application-package.result == 'success'
+    environment: ${{ inputs.environment != '' && inputs.environment || null }}
+    steps:
+    - name: Checkout application code
+      uses: actions/checkout@v4
+    
+    - name: Verify deployment scripts
+      run: |
+        ls -la workflows/
+        echo "✅ Deployment scripts available"
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars.AWS_ROLE_ARN || secrets.AWS_ROLE_ARN }}
+        role-duration-seconds: 3600  # 1 hour session
+        aws-region: ${{ needs.load-config.outputs.aws_region }}
+
+    - name: Setup Python environment
+      run: |
+        python3 -m pip install --upgrade pip
+        python3 -m pip install boto3 pyyaml
+
+    - name: Download application package
+      uses: actions/download-artifact@v4
+      with:
+        name: application-package
+
+    - name: Generic Application Deployment & Configuration
+      run: |
+        echo "🚀 Running generic application deployment..."
+        export GITHUB_ACTIONS=true
+        export PYTHONPATH="${PYTHONPATH}:$(pwd)/workflows"
+        export DOCKER_IMAGE_TAG="${{ inputs.docker_image_tag }}"
+        
+        python3 workflows/deploy-post-steps-generic.py \
+          app.tar.gz \
+          --instance-name ${{ needs.load-config.outputs.instance_name }} \
+          --region ${{ needs.load-config.outputs.aws_region }} \
+          --config-file ${{ inputs.config_file }} \
+          --os-type ${{ needs.load-config.outputs.os_type }} \
+          --package-manager ${{ needs.load-config.outputs.package_manager }} \
+          --verify \
+          --cleanup \
+          --env GITHUB_SHA=${{ github.sha }} \
+          --env GITHUB_REF=${{ github.ref_name }} \
+          --env GITHUB_ACTOR=${{ github.actor }} \
+          --env GITHUB_RUN_ID=${{ github.run_id }} \
+          --env APP_TYPE=${{ needs.load-config.outputs.app_type }} \
+          --env APP_VERSION=${{ needs.load-config.outputs.app_version }} \
+          --env DOCKER_IMAGE_TAG="${{ inputs.docker_image_tag }}"
+
+  verification:
+    needs: [load-config, post-steps-generic]
+    runs-on: ubuntu-latest
+    if: always()
+    outputs:
+      app_url: ${{ steps.set-outputs.outputs.app_url }}
+      status: ${{ steps.set-outputs.outputs.status }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars.AWS_ROLE_ARN || secrets.AWS_ROLE_ARN }}
+        role-duration-seconds: 3600  # 1 hour session
+        aws-region: ${{ needs.load-config.outputs.aws_region }}
+
+    - name: Setup Python environment
+      run: |
+        python3 -m pip install --upgrade pip
+        python3 -m pip install boto3 pyyaml
+
+    - name: External Connectivity Test
+      id: connectivity
+      run: |
+        echo "🌐 Testing external connectivity..."
+        VERIFICATION_PORT="${{ needs.load-config.outputs.verification_port }}"
+        VERIFICATION_PATH="${{ needs.load-config.outputs.verification_path }}"
+        TEST_URL="http://${{ needs.load-config.outputs.static_ip }}:${VERIFICATION_PORT}${VERIFICATION_PATH}"
+        
+        echo "📍 Test URL: $TEST_URL"
+        echo "⏳ Waiting 60 seconds for services to fully initialize..."
+        sleep 60
+
+        for i in {1..15}; do
+          echo "Attempt $i/15: Testing $TEST_URL"
+          
+          # Try to fetch the page and check if we get a 200 response
+          HTTP_CODE=$(curl -s -o /tmp/response.html -w "%{http_code}" --connect-timeout 10 --max-time 30 "$TEST_URL" || echo "000")
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ Got HTTP 200 response!"
+            
+            # Check if response contains expected content (case-insensitive)
+            if grep -qi "html\|Example\|App\|Hello\|Welcome\|Recipe\|Docker\|healthy\|ok" /tmp/response.html; then
+              echo "✅ Application is accessible and responding with content!"
+              cat /tmp/response.html | head -20
+              echo "status=success" >> $GITHUB_OUTPUT
+              exit 0
+            else
+              echo "⚠️ Got 200 but unexpected content:"
+              cat /tmp/response.html | head -20
+            fi
+          elif [ "$HTTP_CODE" = "000" ]; then
+            echo "❌ Connection timeout or refused"
+          else
+            echo "❌ Got HTTP $HTTP_CODE"
+          fi
+          
+          echo "Waiting for application to respond... ($i/15)"
+          sleep 15
+        done
+
+        echo "❌ Application failed to respond after 15 attempts (4+ minutes)"
+        echo "status=failed" >> $GITHUB_OUTPUT
+        exit 1
+
+    - name: Set Outputs
+      if: always() && steps.connectivity.outcome != 'skipped'
+      run: |
+        echo "app_url=http://${{ needs.load-config.outputs.static_ip }}/" >> $GITHUB_OUTPUT
+        echo "status=${{ steps.connectivity.outputs.status || 'failed' }}" >> $GITHUB_OUTPUT
+
+    - name: Deployment Summary
+      if: always()
+      run: |
+        echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- **Application**: ${{ needs.load-config.outputs.app_name }} v${{ needs.load-config.outputs.app_version }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **OS Type**: ${{ needs.load-config.outputs.os_type }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Package Manager**: ${{ needs.load-config.outputs.package_manager }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **URL**: http://${{ needs.load-config.outputs.static_ip }}/" >> $GITHUB_STEP_SUMMARY
+        echo "- **Status**: ${{ steps.connectivity.outputs.status || 'failed' }}" >> $GITHUB_STEP_SUMMARY

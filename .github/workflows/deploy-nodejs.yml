@@ -1,0 +1,62 @@
+name: Simple Blog App Deployment
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'example-nodejs-app/**'
+      - 'deployment-nodejs.config.yml'
+      - '.github/workflows/deploy-nodejs.yml'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'example-nodejs-app/**'
+      - 'deployment-nodejs.config.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: false
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+permissions:
+  id-token: write   # Required for OIDC authentication
+  contents: read    # Required to checkout code
+
+jobs:
+  deploy:
+    name: Deploy Simple Blog App
+    uses: ./.github/workflows/deploy-generic-reusable.yml
+    with:
+      config_file: 'deployment-nodejs.config.yml'
+      aws_region: 'us-east-1'
+    secrets: inherit
+  
+  summary:
+    name: Deployment Summary
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Show Deployment Results
+        run: |
+          echo "## 🚀 Simple Blog App Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL**: ${{ needs.deploy.outputs.deployment_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ needs.deploy.outputs.deployment_status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.deploy.outputs.deployment_status }}" = "success" ]; then
+            echo "✅ Application deployed successfully!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 📡 Endpoints" >> $GITHUB_STEP_SUMMARY
+            echo "- **Home**: ${{ needs.deploy.outputs.deployment_url }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Health**: ${{ needs.deploy.outputs.deployment_url }}api/health" >> $GITHUB_STEP_SUMMARY
+            echo "- **Info**: ${{ needs.deploy.outputs.deployment_url }}api/info" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Deployment failed. Check logs above." >> $GITHUB_STEP_SUMMARY
+          fi
